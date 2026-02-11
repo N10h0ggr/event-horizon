@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "crates/singularity", # The Driver
+    "crates/observer",    # The App
+    "crates/shared", "singularity",      # Common structs/IOCTL codes
+]
+resolver = "2"
