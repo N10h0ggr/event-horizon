@@ -3,4 +3,21 @@ name = "singularity"
 version = "0.1.0"
 edition = "2024"
 
+[package.metadata.wdk.driver-model]
+driver-type = "WDM"
+
+[lib]
+crate-type = ["cdylib"]
+test = false
+
 [dependencies]
+log = "0.4.29"
+shared = { path = "../shared" }
+wdk = "0.4.1"
+wdk-sys = "0.5.1"
+wdk-alloc = "0.4.1"
+wdk-panic = "0.4.1"
+windows-sys = {workspace = true}
+
+[build-dependencies]
+wdk-build = "0.5.1"

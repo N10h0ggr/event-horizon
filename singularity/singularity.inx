@@ -1,0 +1,52 @@
+; singularity.inx
+;
+; Singularity Kernel Driver
+; Copyright (c) 2024
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderString%
+CatalogFile = singularity.cat
+DriverVer   = 01/01/2024,1.0.0.0
+PnpLockdown = 1
+
+[DestinationDirs]
+; Use DIRID 13 for all file copies to comply with Driver Isolation
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskId1%,,,""
+
+[SourceDisksFiles]
+singularity.sys = 1,,
+
+; ================= Install Section =================
+
+[DefaultInstall.NT$ARCH$]
+CopyFiles = Drivers_Dir
+
+[Drivers_Dir]
+singularity.sys
+
+; ================= Service Section =================
+
+[DefaultInstall.NT$ARCH$.Services]
+AddService = Singularity,0,Singularity_Service_Inst
+
+[Singularity_Service_Inst]
+DisplayName    = %Singularity.SvcDesc%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+; Use %13% to point to the Driver Store location
+ServiceBinary  = %13%\singularity.sys
+
+; ================= Strings Section =================
+
+[Strings]
+ProviderString      = "Rust Workspace"
+DiskId1             = "Singularity Driver Installation Disk"
+Singularity.SvcDesc = "Singularity Kernel Driver"

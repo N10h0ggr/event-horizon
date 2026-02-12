@@ -1,7 +1,30 @@
 [workspace]
 members = [
-    "crates/singularity", # The Driver
-    "crates/observer",    # The App
-    "crates/shared", "singularity",      # Common structs/IOCTL codes
+    "singularity", # The Driver
+    "observer",    # The App
+    "shared",      # Common structs/IOCTL codes
 ]
 resolver = "2"
+
+[profile.dev]
+# Global setting: Required for the driver, compatible with the app
+panic = "abort"
+lto = "thin"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = 3
+
+# Change this line right here:
+[workspace.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_System_Diagnostics_Etw",
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_Ioctl",
+    "Win32_Security",
+    "Win32_System_Time",
+    "Win32_System_Threading",
+    "Wdk",
+]}

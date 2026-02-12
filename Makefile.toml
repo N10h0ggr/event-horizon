@@ -1,0 +1,27 @@
+[config]
+default_to_workspace = false
+
+[tasks.default]
+alias = "build-all"
+
+[tasks.build-all]
+description = "Builds all workspace members in parallel."
+run_task = { name = ["build-shared", "build-observer", "build-singularity"], parallel = true }
+
+[tasks.build-shared]
+description = "Builds the shared library."
+command = "cargo"
+args = ["build", "-p", "shared"]
+
+[tasks.build-observer]
+description = "Builds the observer user-mode application."
+command = "cargo"
+args = ["build", "-p", "observer"]
+dependencies = ["build-shared"]
+
+[tasks.build-singularity]
+description = "Builds the singularity kernel driver."
+cwd = "singularity"
+command = "cargo"
+args = ["make"]
+env = { "RUSTFLAGS" = "-C target-feature=+crt-static" }

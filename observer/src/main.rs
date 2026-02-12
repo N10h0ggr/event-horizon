@@ -10,12 +10,15 @@ use uuid::Uuid;
 mod elastic;
 mod etw;
 mod schema;
+mod driver;
 
 use crate::etw::manifest::fetch_manifest_for_provider;
 use crate::etw::provider::{process_events, start_trace_session, stop_trace_session};
 use reqwest::blocking::Client;
 use std::sync::mpsc;
 use std::thread;
+use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+use crate::driver::set_process_ppl;
 
 /// Configuration structure representing the command-line arguments.
 ///
@@ -100,7 +103,14 @@ fn run(args: Cli) -> anyhow::Result<()> {
     // Determine which identity we are using.
     // The ArgGroup guarantees at least one of these is Some.
     if let Some(guid) = args.etw_guid {
+
         info!("Targeting ETW Provider GUID: {}", guid);
+
+        // Request PPL access
+        let pid = unsafe { GetCurrentProcessId() };
+        set_process_ppl(pid)?;
+
+        // Fetch the provider
         let schema = fetch_manifest_for_provider(guid)?;
         trace!("Schema: {:#?}", schema);
 
