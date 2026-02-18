@@ -1,184 +1,158 @@
-// Only compile this module on Windows, as ETW is Windows-specific.
-#![cfg(windows)]
+use std::ffi::c_void;
+use std::ptr::{null, null_mut};
+use log;
+use windows_sys::Win32::System::Threading::{
+    CreateThread, GetCurrentProcessId, WaitForSingleObject
+};
 
-use clap::{ArgGroup, Parser};
-use log::{LevelFilter, error, info, trace};
-use std::process::ExitCode;
-use url::Url;
-use uuid::Uuid;
 
-mod elastic;
 mod etw;
-mod schema;
-mod driver;
+use etw::filter;
+use etw::utils::guid_to_string;
 
-use crate::etw::manifest::fetch_manifest_for_provider;
-use crate::etw::provider::{process_events, start_trace_session, stop_trace_session};
-use reqwest::blocking::Client;
-use std::sync::mpsc;
-use std::thread;
-use windows_sys::Win32::System::Threading::GetCurrentProcessId;
-use crate::driver::set_process_ppl;
+const MICROSOFT_WINDOWS_KERNEL_AUDIT_API_CALLS: &str = "E02A841C-75A3-4FA7-AFC8-AE09CF9B7F23";
+const MICROSOFT_WINDOWS_THREAT_INTEL: &str = "F4E1897C-BB5D-5668-F1D8-040F4D8DD344";
+const EVENTID_OPENTHREAD: u16 = 4;
+const EVENTID_SETTHREADCONTEXT: u16 = 6;
 
-/// Configuration structure representing the command-line arguments.
-///
-/// We derive `Parser` to allow Clap to automatically generate the CLI logic.
-/// The `ArgGroup` ensures that the user provides either a GUID, a Provider Name, or both,
-/// but never neither.
-#[derive(Parser, Debug)]
-#[command(name = "irontrace")]
-#[command(version = "1.0")]
-#[command(about = "Captures ETW events and forwards them to a remote URL.")]
-#[command(group(
-    ArgGroup::new("provider_identity")
-        .required(true)
-        .args(["etw_guid", "provider_name"])
-))]
-struct Cli {
-    /// The unique identifier (GUID) of the ETW provider.
-    ///
-    /// Validated automatically into a Uuid type to prevent format errors early.
-    #[arg(short = 'g', long, value_parser = clap::value_parser!(Uuid))]
-    etw_guid: Option<Uuid>,
+const EVENT_ENABLE_PROPERTY_STACK_TRACE: u32 = 4; 
 
-    /// The human-readable name of the ETW provider.
-    ///
-    /// This is required if the GUID is not provided.
-    #[arg(short = 'n', long)]
-    provider_name: Option<String>,
 
-    /// The destination URL for the telemetry data.
-    ///
-    /// validated as a standard URL.
-    #[arg(short = 'u', long, value_parser = clap::value_parser!(Url))]
-    url: Url,
+// This function is passed to a trampoline function that matches the needed C
+// structure and parses the EVENT_RECORD using the provider schema or TDH
+fn syscall_detection_callback(event: &etw::Event) {
+    // 1. Get Current Process ID to skip our own events
+    let current_pid: u32 = unsafe { GetCurrentProcessId() };
 
-    /// Username for authentication with the remote endpoint.
-    #[arg(short = 'U', long)]
-    username: String,
-
-    /// Password for authentication.
-    ///
-    /// In a real-world scenario, consider reading this from stdin or an environment variable
-    /// to avoid leaking it in shell history.
-    #[arg(short = 'P', long)]
-    password: String,
-}
-
-fn uuid_to_guid(uuid: &Uuid) -> windows_sys::core::GUID {
-    let (data1, data2, data3, data4) = uuid.as_fields();
-    windows_sys::core::GUID {
-        data1,
-        data2,
-        data3,
-        data4: *data4,
-    }
-}
-
-fn main() -> ExitCode {
-    // Initialize the logger.
-    // We default to 'Debug' level so the user sees operation status and parsing warnings.
-    let mut builder = env_logger::Builder::from_default_env();
-    builder.filter_level(LevelFilter::Trace);
-    builder.init();
-
-    info!("Initializing ETW Relay...");
-
-    // Parse arguments. If parsing fails, Clap prints the error and exits automatically.
-    let args = Cli::parse();
-
-    if let Err(e) = run(args) {
-        // Log the error cleanly and return a non-zero exit code.
-        error!("Application failed: {:#}", e);
-        return ExitCode::FAILURE;
+    if event.pid() == current_pid {
+        return;
     }
 
-    ExitCode::SUCCESS
-}
-
-/// Core application logic.
-///
-/// This isolates the "doing" part of the application from the setup/parsing.
-fn run(args: Cli) -> anyhow::Result<()> {
-    // Determine which identity we are using.
-    // The ArgGroup guarantees at least one of these is Some.
-    if let Some(guid) = args.etw_guid {
-
-        info!("Targeting ETW Provider GUID: {}", guid);
-
-        // Request PPL access
-        let pid = unsafe { GetCurrentProcessId() };
-        set_process_ppl(pid)?;
-
-        // Fetch the provider
-        let schema = fetch_manifest_for_provider(guid)?;
-        trace!("Schema: {:#?}", schema);
-
-        // Generate the Elastic index mapping
-        let mapping = elastic::index::generate_index_mapping(&schema);
-        info!("Generated Elastic mapping for provider {}.", guid);
-
-        // Create the index in Elasticsearch
-        // We use the provider GUID as the index name for uniqueness and clarity
-        let client = Client::builder()
-            .danger_accept_invalid_certs(true)
-            .build()?;
-        let index_name = format!("etw-{}", guid).to_lowercase();
-        elastic::client::create_index(
-            &client,
-            &args.url,
-            &args.username,
-            &args.password,
-            &index_name,
-            &mapping,
-        )?;
-
-        let session_name = "IrontraceSession";
-        let provider_guid_sys = uuid_to_guid(&guid);
-
-        // Stop previous session if it exists (restart)
-        stop_trace_session(session_name);
-
-        // Start session
-        start_trace_session(session_name, &provider_guid_sys)?;
-
-        let (tx, rx) = mpsc::channel();
-        let session_name_thread = session_name.to_string();
-        let schema_thread = schema.clone();
-
-        // Spawn thread to process events
-        thread::spawn(move || {
-            if let Err(e) = process_events(&session_name_thread, schema_thread, tx) {
-                error!("Event processing failed: {}", e);
+    // 2. Match Event ID based on the provided Manifest
+    // We parse specific fields known to exist for these IDs.
+    match event.id() {
+        // Event 4: OpenThread (or similar) - Manifest shows only ReturnCode
+        4 => {
+            log::info!("[Event 4] Detected from PID: {}", event.pid());
+            if let Ok(ret) = event.get_property("ReturnCode") {
+                log::debug!("  -> ReturnCode: {}", ret);
             }
-        });
-
-        // Handle CTRL+C for graceful shutdown
-        let session_name_ctrlc = session_name.to_string();
-        ctrlc::set_handler(move || {
-            info!("Received shutdown signal. Stopping ETW session...");
-            stop_trace_session(&session_name_ctrlc);
-            std::process::exit(0);
-        })?;
-
-        info!("Starting event listener loop. Press Ctrl+C to stop.");
-
-        while let Ok(event) = rx.recv() {
-            if let Err(e) = elastic::client::index_event(
-                &client,
-                &args.url,
-                &args.username,
-                &args.password,
-                &index_name,
-                &event,
-            ) {
-                error!("Failed to index event: {}", e);
+        },
+        // Event 5: OpenProcess - TargetProcessId, DesiredAccess, ReturnCode
+        5 => {
+            log::info!("[Event 5] OpenProcess Detected from PID: {}", event.pid());
+            if let Ok(target_pid) = event.get_property("TargetProcessId") {
+                log::info!("  -> Target PID: {}", target_pid);
             }
+            if let Ok(access) = event.get_property("DesiredAccess") {
+                log::info!("  -> Desired Access: {}", access);
+            }
+            if let Ok(ret) = event.get_property("ReturnCode") {
+                log::debug!("  -> ReturnCode: {}", ret);
+            }
+        },
+        // Event 6: SetThreadContext - TargetProcessId, TargetThreatId, DesiredAccess
+        6 => {
+            log::info!("[Event 6] SetThreadContext Detected from PID: {}", event.pid());
+            if let Ok(target_pid) = event.get_property("TargetProcessId") {
+                log::info!("  -> Target PID: {}", target_pid);
+            }
+            // Note: Manifest output listed this as "TargetThreatId" (likely a Windows typo),
+            // so we must use that exact string key.
+            if let Ok(target_tid) = event.get_property("TargetThreatId") {
+                log::info!("  -> Target TID: {}", target_tid);
+            }
+            if let Ok(access) = event.get_property("DesiredAccess") {
+                log::info!("  -> Desired Access: {}", access);
+            }
+            if let Ok(ret) = event.get_property("ReturnCode") {
+                log::debug!("  -> ReturnCode: {}", ret);
+            }
+        },
+        // Handle other IDs generic logging if needed
+        id => {
+            log::debug!("Event ID {} detected from PID: {}", id, event.pid());
         }
-    } else if let Some(_name) = &args.provider_name {
-        // TODO: If GUID is missing resolve name string to a GUID.
-        todo!("Provider name not implemented yet")
     }
 
-    Ok(())
+    // 3. Process Stack Trace
+    let stack = event.stack_trace();
+    if stack.is_empty() {
+        return;
+    }
+
+    log::trace!("  -> Stack Trace ({} frames):", stack.len());
+    for (i, addr) in stack.iter().enumerate() {
+        log::trace!("     [{}] {:#x}", i, addr);
+    }
 }
+
+// This matches: pub unsafe extern "system" fn(lpthreadparameter: *mut c_void) -> u32
+unsafe extern "system" fn event_loop_entry(user_trace_ptr: *mut c_void) -> u32 {
+    // Cast the void pointer back to the Rust reference
+    let user_trace = unsafe { &*(user_trace_ptr as *const etw::UserTrace) };
+    user_trace.start()
+}
+
+// TODO: Add proper return type for Windows
+fn main() {
+
+    env_logger::init();
+
+    // Define the Session (User or Kernel)
+    let mut user_trace = etw::UserTrace::new("Syscalls-Detector");
+
+    // Define the Provider
+    let mut provider = etw::Provider::new(MICROSOFT_WINDOWS_KERNEL_AUDIT_API_CALLS)
+        .trace_flags(EVENT_ENABLE_PROPERTY_STACK_TRACE);
+
+    provider.load_manifest().expect("Failed to load provider manifest");
+    if let Some(manifest) = &provider.manifest {
+        log::trace!("Provider manifest: {:?}", manifest);
+    }
+
+    let mut filter_open_thread = etw::EventFilter::new(filter::DoesMatch(EVENTID_OPENTHREAD));
+    let mut filter_set_context_threat = etw::EventFilter::new(filter::DoesMatch(EVENTID_SETTHREADCONTEXT));
+
+    filter_open_thread.add_callback(syscall_detection_callback);
+    filter_set_context_threat.add_callback(syscall_detection_callback);
+
+    provider.add_filter(filter_open_thread);
+    provider.add_filter(filter_set_context_threat);
+
+    log::debug!("Enabling provider {}: {}", provider.name, guid_to_string(&provider.guid));
+
+    user_trace.enable(provider).unwrap();
+
+    // pub unsafe extern "system" fn CreateThread(
+    //     lpthreadattributes: *const SECURITY_ATTRIBUTES,
+    //     dwstacksize: usize,
+    //     lpstartaddress: LPTHREAD_START_ROUTINE,
+    //     lpparameter: *const c_void,
+    //     dwcreationflags: THREAD_CREATION_FLAGS,
+    //     lpthreadid: *mut u32,
+    // ) -> HANDLE
+    let trace_thread_handle = unsafe {
+        CreateThread(
+            null(),
+            0,
+            Some(event_loop_entry),
+            &mut user_trace as *mut _ as *mut c_void,
+            0,
+            null_mut(),
+        )
+    };
+
+    if trace_thread_handle.is_null() {
+        return;
+    }
+
+    // pub unsafe extern "system" fn WaitForSingleObject(
+    //     hhandle: HANDLE,
+    //     dwmilliseconds: u32,
+    // ) -> WAIT_EVENT
+    unsafe { WaitForSingleObject(trace_thread_handle, 10000) };
+    user_trace.stop();
+}
+
+

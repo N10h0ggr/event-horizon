@@ -1,216 +1,227 @@
-use crate::etw::parser;
-use crate::schema::EtwManifest;
-use anyhow::{Result, anyhow};
-use log::{error, info, warn};
-use serde_json::Value;
-use std::ptr;
-use std::sync::mpsc::Sender;
-use windows_sys::Win32::Foundation::{ERROR_SUCCESS, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::System::Diagnostics::Etw::{
-    CONTROLTRACE_HANDLE, CloseTrace, ControlTraceW, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-    EVENT_RECORD, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
-    EVENT_TRACE_REAL_TIME_MODE, EnableTraceEx2, OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD,
-    PROCESS_TRACE_MODE_REAL_TIME, ProcessTrace, StartTraceW, WNODE_FLAG_TRACED_GUID,
-};
+use std::sync::Arc;
+use crate::etw::types::{FilterCondition, EventCallback};
+use windows_sys::core::GUID;
+use windows_sys::Win32::System::Diagnostics::Etw::{TdhEnumerateProviders, EVENT_FILTER_DESCRIPTOR, EVENT_FILTER_TYPE_EVENT_ID, PROVIDER_ENUMERATION_INFO};
+use crate::etw::errors::EtwError;
+use crate::etw::manifest_parser::{EventSchema, ManifestParser};
 
-/// Context passed to the callback function.
-struct EtwContext {
-    schema: EtwManifest,
-    sender: Sender<Value>,
+/// ETW Log Levels (aligned with Windows definitions)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum LogLevel {
+    Critical = 1,
+    Error = 2,
+    Warning = 3,
+    Info = 4,
+    Verbose = 5,
 }
 
-pub fn start_trace_session(
-    session_name: &str,
-    provider_guid: &windows_sys::core::GUID,
-) -> Result<u64> {
-    let session_name_wide: Vec<u16> = session_name
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-
-    // Size: Struct + Name + buffer
-    let buffer_size =
-        std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + (session_name_wide.len() * 2) + 2048;
-    let mut buffer = vec![0u8; buffer_size];
-
-    let props = unsafe { &mut *(buffer.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES) };
-
-    props.Wnode.BufferSize = buffer_size as u32;
-    props.Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-    props.Wnode.ClientContext = 1; // QPC
-    props.LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
-    props.LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
-
-    let session_handle: u64 = 0;
-
-    // Best effort stop
-    unsafe {
-        ControlTraceW(
-            CONTROLTRACE_HANDLE { Value: 0 },
-            session_name_wide.as_ptr(),
-            props,
-            EVENT_TRACE_CONTROL_STOP,
-        );
-    }
-
-    // Reset properties
-    props.Wnode.BufferSize = buffer_size as u32;
-    props.Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-    props.Wnode.ClientContext = 1;
-    props.LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
-    props.LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
-
-    info!("Starting ETW session '{}'...", session_name);
-
-    let mut control_handle = CONTROLTRACE_HANDLE {
-        Value: session_handle,
-    };
-
-    let status = unsafe { StartTraceW(&mut control_handle, session_name_wide.as_ptr(), props) };
-
-    if status != ERROR_SUCCESS {
-        return Err(anyhow!("StartTraceW failed with error {}", status));
-    }
-
-    info!("ETW Session started. Handle: {:x}", control_handle.Value);
-
-    let status = unsafe {
-        EnableTraceEx2(
-            control_handle,
-            provider_guid,
-            EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-            4,                     // Verbose/Info
-            0xFFFFFFFFFFFFFFFFu64, // All Keywords
-            0,
-            0,
-            ptr::null_mut(),
-        )
-    };
-
-    if status != ERROR_SUCCESS {
-        stop_trace_session(session_name);
-        return Err(anyhow!("EnableTraceEx2 failed with error {}", status));
-    }
-
-    info!("Provider enabled.");
-    Ok(session_handle)
-}
-
-pub fn stop_trace_session(session_name: &str) {
-    let session_name_wide: Vec<u16> = session_name
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-
-    let buffer_size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 4096;
-    let mut buffer = vec![0u8; buffer_size];
-    let props = unsafe { &mut *(buffer.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES) };
-    props.Wnode.BufferSize = buffer_size as u32;
-
-    let status = unsafe {
-        ControlTraceW(
-            CONTROLTRACE_HANDLE { Value: 0 },
-            session_name_wide.as_ptr(),
-            props,
-            EVENT_TRACE_CONTROL_STOP,
-        )
-    };
-
-    if status != ERROR_SUCCESS {
-        warn!("ControlTraceW (STOP) returned {}", status);
-    } else {
-        info!("ETW Session stopped.");
+impl Default for LogLevel {
+    fn default() -> Self {
+        LogLevel::Verbose
     }
 }
 
-/// The safe C-callback wrapper
-unsafe extern "system" fn event_record_callback(record: *mut EVENT_RECORD) {
-    if record.is_null() {
-        return;
+/// Represents a specific Event Filter configuration
+#[derive(Clone)]
+pub struct EventFilter {
+    pub condition: FilterCondition,
+    pub callbacks: Vec<Arc<EventCallback>>,
+}
+
+impl EventFilter {
+    pub fn new(condition: FilterCondition) -> Self {
+        Self {
+            condition,
+            callbacks: Vec::new(),
+        }
     }
 
-    let record_ref = unsafe { &*record };
+    pub fn add_callback(&mut self, callback: EventCallback) {
+        self.callbacks.push(Arc::new(callback));
+    }
+}
 
-    // Safety: UserContext is void*, we cast it back to our Rust struct.
-    // This pointer is guaranteed valid because we box/leak it in process_events
-    // and only free it after ProcessTrace returns.
-    if record_ref.UserContext.is_null() {
-        return;
+/// Configuration for an ETW Provider
+pub struct Provider {
+    pub name: String,
+    pub guid: GUID,
+    pub any_keyword: u64,
+    pub all_keyword: u64,
+    pub level: LogLevel,
+    pub trace_flags: Option<u32>,
+    pub filters: Vec<EventFilter>,
+    pub manifest: Option<ManifestParser>,
+}
+
+// Clone for Provider needs manual impl because ManifestParser is not strictly Clone
+// (HashMap is cloneable, but conceptually ManifestParser is heavy)
+impl Clone for Provider {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            guid: self.guid,
+            any_keyword: self.any_keyword,
+            all_keyword: self.all_keyword,
+            level: self.level,
+            trace_flags: self.trace_flags,
+            filters: self.filters.clone(),
+            // We usually don't want to clone the ManifestParser implicitly because it's heavy.
+            // If the user wants it, they must re-load it or we need to make ManifestParser
+            // internally ref-counted (Arc). For now, we set it to None on clone.
+            manifest: None,
+        }
+    }
+}
+
+impl Provider {
+    /// Creates a new Provider.
+    pub fn new(guid: &str) -> Self {
+        Self {
+            name: Self::guid_to_name(guid),
+            guid: crate::etw::utils::string_to_guid(guid),
+            any_keyword: 0,
+            all_keyword: 0,
+            level: LogLevel::default(), // Defaults to Verbose
+            trace_flags: None,
+            filters: Vec::new(),
+            manifest: None,
+        }
     }
 
-    let ctx = unsafe { &*(record_ref.UserContext as *const EtwContext) };
+    /// Attempts to load and parse the ETW Manifest for this provider.
+    /// This populates the `self.manifest` field.
+    pub fn load_manifest(&mut self) -> crate::etw::errors::Result<()> {
+        let parser = ManifestParser::new(self.guid)?;
+        self.manifest = Some(parser);
+        Ok(())
+    }
 
-    match parser::parse_event(record_ref, &ctx.schema) {
-        Ok(json) => {
-            if let Err(e) = ctx.sender.send(json) {
-                error!("Failed to send event to channel: {}", e);
+    /// Builder: Set specific keywords
+    pub fn keywords(mut self, any: u64, all: u64) -> Self {
+        self.any_keyword = any;
+        self.all_keyword = all;
+        self
+    }
+
+    /// Builder: Set specific trace flags
+    pub fn trace_flags(mut self, flags: u32) -> Self {
+        self.trace_flags = Some(flags);
+        self
+    }
+    
+    /// Builder: Set log level
+    pub fn level(mut self, level: LogLevel) -> Self {
+        self.level = level;
+        self
+    }
+
+    /// Add a filter to the provider
+    pub fn add_filter(&mut self, filter: EventFilter) {
+        self.filters.push(filter);
+    }
+
+    /// Internal helper to build the filter descriptors for EnableTraceEx2
+    pub fn build_filter_descriptors(&self) -> (Vec<EVENT_FILTER_DESCRIPTOR>, Vec<Vec<u8>>) {
+        let mut descriptors = Vec::new();
+        let mut buffers = Vec::new();
+
+        // Filter by Event ID
+        // Note: Windows ETW filtering for Event IDs expects a specific binary layout:
+        // EVENT_FILTER_EVENT_ID structure:
+        // FilterIn (Boolean u8), Reserved (u8), Count (u16), EventIds (Array of u16)
+
+        let event_ids: Vec<u16> = self.filters.iter()
+            .filter_map(|f| {
+                if let FilterCondition::DoesMatch(id) = f.condition {
+                    Some(id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if !event_ids.is_empty() {
+            let mut buffer = Vec::new();
+            let filter_in: u8 = 1; // 1 = Include these IDs, 0 = Exclude
+            let reserved: u8 = 0;
+            let count: u16 = event_ids.len() as u16;
+
+            buffer.extend_from_slice(&filter_in.to_ne_bytes());
+            buffer.extend_from_slice(&reserved.to_ne_bytes());
+            buffer.extend_from_slice(&count.to_ne_bytes());
+            for id in event_ids {
+                buffer.extend_from_slice(&id.to_ne_bytes());
+            }
+
+            let descriptor = EVENT_FILTER_DESCRIPTOR {
+                Ptr: buffer.as_ptr() as u64,
+                Size: buffer.len() as u32,
+                Type: EVENT_FILTER_TYPE_EVENT_ID,
+            };
+
+            descriptors.push(descriptor);
+            buffers.push(buffer); // Keep buffer alive so Ptr remains valid
+        }
+
+        (descriptors, buffers)
+    }
+
+    fn guid_to_name(guid_str: &str) -> String {
+        let target_guid = crate::etw::utils::string_to_guid(guid_str);
+        let mut buffer_size: u32 = 0;
+
+        unsafe {
+            // First call: Get the required buffer size
+            let mut status = TdhEnumerateProviders(std::ptr::null_mut(), &mut buffer_size);
+
+            // ERROR_INSUFFICIENT_BUFFER (122) is expected here
+            if status != 122 && status != 0 {
+                return guid_str.to_string();
+            }
+
+            // Allocate the buffer based on the returned size
+            let mut buffer: Vec<u8> = vec![0u8; buffer_size as usize];
+            let p_info = buffer.as_mut_ptr() as *mut PROVIDER_ENUMERATION_INFO;
+
+            // Second call: Fill the buffer with actual provider data
+            status = TdhEnumerateProviders(p_info, &mut buffer_size);
+
+            if status == 0 {
+                let info = &*p_info;
+                // TraceProviderInfoArray is defined as [TRACE_PROVIDER_INFO; 1] in the bindings,
+                // but it actually contains 'NumberOfProviders' elements in memory.
+                let providers = std::slice::from_raw_parts(
+                    info.TraceProviderInfoArray.as_ptr(),
+                    info.NumberOfProviders as usize,
+                );
+
+                for provider in providers {
+                    if crate::etw::utils::guids_equal(&provider.ProviderGuid, &target_guid) {
+                        // The ProviderNameOffset is the byte offset from the start of the buffer
+                        // to the null-terminated UTF-16 string (the provider name).
+                        let name_ptr = (p_info as *const u8).offset(provider.ProviderNameOffset as isize) as *const u16;
+                        return utf16_ptr_to_string(name_ptr);
+                    }
+                }
             }
         }
-        Err(_e) => {
-            // Only log occasional errors or debug to avoid flooding
-            // warn!("Failed to parse: {}", e);
-        }
+
+        guid_str.to_string()
     }
 }
 
-pub fn process_events(
-    session_name: &str,
-    schema: EtwManifest,
-    sender: Sender<Value>,
-) -> Result<()> {
-    // We Box the context and leak it into a raw pointer.
-    // This pointer remains valid for the duration of ProcessTrace.
-    let context = Box::new(EtwContext { schema, sender });
-    let context_ptr = Box::into_raw(context);
+// --- Helper Functions ---
 
-    let session_name_wide: Vec<u16> = session_name
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-
-    let mut log_file: EVENT_TRACE_LOGFILEW = unsafe { std::mem::zeroed() };
-    log_file.LoggerName = session_name_wide.as_ptr() as *mut u16;
-    log_file.Anonymous1.ProcessTraceMode =
-        PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
-
-    // Set the callback
-    log_file.Anonymous2.EventRecordCallback = Some(event_record_callback);
-
-    // Set the context! ETW will pass this back in EVENT_RECORD.UserContext
-    log_file.Context = context_ptr as *mut _;
-
-    info!("Opening trace for processing...");
-    let trace_handle = unsafe { OpenTraceW(&mut log_file as *mut EVENT_TRACE_LOGFILEW) };
-
-    if trace_handle.Value == INVALID_HANDLE_VALUE as u64 {
-        // Reclaim memory before returning error
-        unsafe {
-            let _ = Box::from_raw(context_ptr);
-        }
-        return Err(anyhow!("OpenTraceW failed."));
-    }
-
-    info!("Processing traces... (blocking)");
-    let status = unsafe {
-        ProcessTrace(
-            &trace_handle as *const _,
-            1,
-            ptr::null_mut(),
-            ptr::null_mut(),
-        )
-    };
-
-    // Clean up
-    unsafe { CloseTrace(trace_handle) };
-
-    // Reclaim memory (Drop the Box)
+/// Safely converts a null-terminated PWSTR (UTF-16) to a Rust String
+unsafe fn utf16_ptr_to_string(ptr: *const u16) -> String {
     unsafe {
-        let _ = Box::from_raw(context_ptr);
+        if ptr.is_null() { return String::new(); }
+        let mut len = 0;
+        while *ptr.offset(len) != 0 {
+            len += 1;
+        }
+        let slice = std::slice::from_raw_parts(ptr, len as usize);
+        String::from_utf16_lossy(slice)
     }
-
-    if status != ERROR_SUCCESS {
-        return Err(anyhow!("ProcessTrace failed with status {}", status));
-    }
-
-    Ok(())
 }
