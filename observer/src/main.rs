@@ -9,6 +9,8 @@ mod etw;
 use etw::filter;
 use etw::utils::guid_to_string;
 
+mod detect;
+
 const MICROSOFT_WINDOWS_KERNEL_AUDIT_API_CALLS: &str = "E02A841C-75A3-4FA7-AFC8-AE09CF9B7F23";
 const MICROSOFT_WINDOWS_THREAT_INTEL: &str = "F4E1897C-BB5D-5668-F1D8-040F4D8DD344";
 
@@ -20,72 +22,26 @@ const EVENT_ENABLE_PROPERTY_STACK_TRACE: u32 = 4;
 // This function is passed to a trampoline function that matches the needed C
 // structure and parses the EVENT_RECORD using the provider schema or TDH
 fn syscall_detection_callback(event: &etw::Event) {
-    // 1. Get Current Process ID to skip our own events
     let current_pid: u32 = unsafe { GetCurrentProcessId() };
-
+    // Skip current process
     if event.pid() == current_pid {
         return;
     }
 
-    // 2. Match Event ID based on the provided Manifest
     // We parse specific fields known to exist for these IDs.
     match event.id() {
-        // Event 4: OpenThread (or similar) - Manifest shows only ReturnCode
-        4 => {
-            log::info!("[Event 4] Detected from PID: {}", event.pid());
-            if let Ok(ret) = event.get_property("ReturnCode") {
-                log::debug!("  -> ReturnCode: {}", ret);
-            }
-        }
-        // Event 5: OpenProcess - TargetProcessId, DesiredAccess, ReturnCode
-        5 => {
-            log::info!("[Event 5] OpenProcess Detected from PID: {}", event.pid());
-            if let Ok(target_pid) = event.get_property("TargetProcessId") {
-                log::info!("  -> Target PID: {}", target_pid);
-            }
-            if let Ok(access) = event.get_property("DesiredAccess") {
-                log::info!("  -> Desired Access: {}", access);
-            }
-            if let Ok(ret) = event.get_property("ReturnCode") {
-                log::debug!("  -> ReturnCode: {}", ret);
-            }
-        }
-        // Event 6: SetThreadContext - TargetProcessId, TargetThreatId, DesiredAccess
-        6 => {
-            log::info!(
-                "[Event 6] SetThreadContext Detected from PID: {}",
-                event.pid()
-            );
-            if let Ok(target_pid) = event.get_property("TargetProcessId") {
-                log::info!("  -> Target PID: {}", target_pid);
-            }
-            // Note: Manifest output listed this as "TargetThreatId" (likely a Windows typo),
-            // so we must use that exact string key.
-            if let Ok(target_tid) = event.get_property("TargetThreatId") {
-                log::info!("  -> Target TID: {}", target_tid);
-            }
-            if let Ok(access) = event.get_property("DesiredAccess") {
-                log::info!("  -> Desired Access: {}", access);
-            }
-            if let Ok(ret) = event.get_property("ReturnCode") {
-                log::debug!("  -> ReturnCode: {}", ret);
-            }
+        EVENTID_OPENTHREAD => {
+            log::trace!("[Event 4] OpenThread Detected from PID: {}", event.pid());
+
+            let _address = match detect::direct_syscalls(&event) {
+                Ok(option_address) => option_address,
+                Err(_e) => None,
+            };
         }
         // Handle other IDs generic logging if needed
         id => {
             log::debug!("Event ID {} detected from PID: {}", id, event.pid());
         }
-    }
-
-    // 3. Process Stack Trace
-    let stack = event.stack_trace();
-    if stack.is_empty() {
-        return;
-    }
-
-    log::trace!("  -> Stack Trace ({} frames):", stack.len());
-    for (i, addr) in stack.iter().enumerate() {
-        log::trace!("     [{}] {:#x}", i, addr);
     }
 }
 
