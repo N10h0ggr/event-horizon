@@ -28,21 +28,10 @@ fn syscall_detection_callback(event: &etw::Event) {
         return;
     }
 
-    // We parse specific fields known to exist for these IDs.
-    match event.id() {
-        EVENTID_OPENTHREAD => {
-            log::trace!("[Event 4] OpenThread Detected from PID: {}", event.pid());
-
-            let _address = match detect::direct_syscalls(&event) {
-                Ok(option_address) => option_address,
-                Err(_e) => None,
-            };
-        }
-        // Handle other IDs generic logging if needed
-        id => {
-            log::debug!("Event ID {} detected from PID: {}", id, event.pid());
-        }
-    }
+    let _address = match detect::direct_syscalls(&event) {
+        Ok(option_address) => option_address,
+        Err(_e) => None,
+    };
 }
 
 // This matches: pub unsafe extern "system" fn(lpthreadparameter: *mut c_void) -> u32
@@ -116,5 +105,7 @@ fn main() {
     //     dwmilliseconds: u32,
     // ) -> WAIT_EVENT
     unsafe { WaitForSingleObject(trace_thread_handle, 20000) };
+
+    // TODO: Handle Control+C termination
     user_trace.stop();
 }
